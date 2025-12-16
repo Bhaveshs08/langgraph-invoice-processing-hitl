@@ -1,233 +1,178 @@
-# LangGraph Invoice Processing Agent with HITL
+# LangGraph Invoice Processing with Human-in-the-Loop (HITL)
 
-## 1. Goal / Problem Statement
+## 📌 Overview
 
-The goal of this project is to design and implement a **production-oriented LangGraph Agent** that models a complete **Invoice Processing workflow** with:
+This project implements an **invoice processing workflow** using **LangGraph**, designed to demonstrate a **production-grade Human-in-the-Loop (HITL) architecture**.
 
-* Deterministic and non-deterministic execution stages
-* Persistent state propagation across nodes
-* **Human-In-The-Loop (HITL)** checkpoints with pause & resume
-* Dynamic **Bigtool-based tool selection**
-* MCP-style server orchestration (COMMON vs ATLAS)
+The system ingests invoice data, performs parsing and validation, applies a matching decision, and **pauses execution for human review** when confidence is low. Workflow state is **persisted to SQLite** and execution is **resumed deterministically** after human approval.
 
-The system demonstrates how modern AI agents can orchestrate complex enterprise workflows while remaining **auditable, resumable, and human-guided** — a critical requirement in Fintech and Finance systems.
+This project was built as part of a **Data Scientist coding assignment**, focusing on orchestration logic, state management, and HITL design — not UI or deployment.
 
 ---
 
-## 2. High-Level Architecture
+## 🧠 Key Design Principles
+
+* **State-driven orchestration** using LangGraph
+* **Durable HITL checkpoints** (SQLite persistence)
+* **Deterministic resume** without re-running upstream steps
+* **Clean separation of concerns** (state, graph, persistence)
+* **Local-first MVP**, suitable for extension to APIs or cloud systems
+
+---
+
+## 🏗️ Architecture
 
 ```
-Client / API
-     │
-     ▼
-FastAPI Application
-     │
-     ▼
-LangGraph Orchestration Engine
-     │
-     ├── Deterministic Nodes
-     ├── Conditional Routing
-     ├── HITL Checkpointing
-     └── Resume Execution
-     │
-     ▼
-SQLite (Checkpoint & State Store)
+┌──────────┐
+│  INTAKE  │  ← Invoice payload received
+└────┬─────┘
+     ↓
+┌────────────┐
+│ UNDERSTAND │  ← OCR / parsing (mocked)
+└────┬───────┘
+     ↓
+┌──────────┐
+│ PREPARE  │  ← Vendor normalization & enrichment
+└────┬─────┘
+     ↓
+┌──────────┐
+│ RETRIEVE │  ← ERP / reference data (mocked)
+└────┬─────┘
+     ↓
+┌──────────────┐
+│ MATCH_TWO_WAY│  ← Confidence scoring
+└────┬─────────┘
+     ↓ (low confidence)
+┌──────────────────┐
+│ CHECKPOINT_HITL  │  ← State saved to SQLite
+└─────────┬────────┘
+          │
+          │  Human Review (async)
+          │
+┌─────────▼────────┐
+│   FINALIZE       │  ← Resume graph after approval
+└──────────────────┘
 ```
 
-Key design principles:
+### 🔑 Important Architectural Insight
 
-* **Single shared state** carried across all nodes
-* **Graph-driven execution**, not procedural scripts
-* **Explicit checkpoints** instead of hidden pauses
+LangGraph **always starts execution from its entry node**.
+To support correct HITL resume **without re-running upstream steps**, this project uses:
 
----
+* **Main Graph** → Executes until HITL pause
+* **Resume Graph** → Continues execution *after* human approval
 
-## 3. Workflow Overview
-
-The agent follows a 12-stage workflow:
-
-1. **INTAKE** – Validate and persist raw invoice payload
-2. **UNDERSTAND** – OCR + line-item parsing
-3. **PREPARE** – Vendor normalization, enrichment, risk flags
-4. **RETRIEVE** – Fetch PO, GRN, invoice history from ERP
-5. **MATCH_TWO_WAY** – Compute invoice vs PO match score
-6. **CHECKPOINT_HITL** – Pause workflow on match failure
-7. **HITL_DECISION** – Human accepts or rejects invoice
-8. **RECONCILE** – Build accounting entries
-9. **APPROVE** – Apply approval policies
-10. **POSTING** – Post to ERP & schedule payment
-11. **NOTIFY** – Notify vendor & finance team
-12. **COMPLETE** – Produce final payload & audit log
+This mirrors real-world workflow engines like Temporal or Airflow.
 
 ---
 
-## 4. State Management Model
+## 📂 Project Structure
 
-All nodes operate on a shared `InvoiceState` object:
-
-```python
-class InvoiceState(TypedDict):
-    invoice_payload: dict
-    parsed_invoice: dict
-    vendor_profile: dict
-    flags: dict
-    match_score: float
-    match_result: str
-    checkpoint_id: str | None
-    status: str
-    logs: list
+```
+langgraph_invoice_processing_hitl/
+│
+├── app/
+│   ├── __init__.py
+│   ├── graph.py          # Main + resume graphs
+│   └── state.py          # Shared InvoiceState definition
+│
+├── db/
+│   ├── database.py       # SQLite initialization
+│   ├── checkpoint_repo.py# Save/load checkpoint logic
+│   └── checkpoints.db    # Auto-created SQLite DB
+│
+├── README.md
+└── requirements.txt
 ```
 
-State guarantees:
+---
 
-* Every node **reads & writes** to the same state
-* Logs are appended at each stage
-* Checkpoints persist the **entire state blob**
+## 🧩 State Model (`InvoiceState`)
+
+The entire workflow is driven by a typed state object:
+
+* `invoice_payload` – Raw invoice input
+* `parsed_invoice` – Extracted fields (mocked)
+* `vendor_profile` – Normalized vendor info
+* `flags` – Risk / enrichment metadata
+* `match_score` – Confidence score
+* `match_result` – MATCHED / FAILED
+* `hitl_checkpoint_id` – Identifier for human review
+* `status` – Workflow status
+* `logs` – Execution trace
+
+This state is **fully serializable** and stored during HITL pauses.
 
 ---
 
-## 5. LangGraph Design
+## 🔄 Workflow Execution
 
-* Each workflow stage is implemented as a **LangGraph node**
-* Deterministic stages execute sequentially
-* Conditional routing is applied after `MATCH_TWO_WAY`
-* If `match_score < threshold` → route to `CHECKPOINT_HITL`
+### 1️⃣ Normal Processing
 
-Resume logic:
+* Invoice is ingested
+* Parsed and enriched
+* Matched against reference data
 
-* Workflow resumes from `RECONCILE` after human approval
-* Rejected invoices terminate with `MANUAL_HANDOFF` status
+### 2️⃣ HITL Trigger
 
----
+If match confidence is low:
 
-## 6. Human-In-The-Loop (HITL) Design
+* Workflow pauses
+* Full state is **persisted to SQLite**
+* Checkpoint ID is generated
 
-### When is HITL triggered?
+### 3️⃣ Human Review (Simulated)
 
-* If `match_score < config.match_threshold`
+* A human reviews the invoice externally
+* Decision is applied to the stored state
 
-### What happens at checkpoint?
+### 4️⃣ Deterministic Resume
 
-* Full `InvoiceState` is serialized to SQLite
-* A `checkpoint_id` is generated
-* Workflow execution is paused
-* Entry is added to the Human Review Queue
-
-### Human Review API
-
-* `GET /human-review/pending`
-* `POST /human-review/decision`
-
-On **ACCEPT**:
-
-* State is reloaded from DB
-* Graph resumes from `RECONCILE`
-
-On **REJECT**:
-
-* Workflow terminates with `REQUIRES_MANUAL_HANDLING`
+* State is loaded from SQLite
+* Execution resumes via **resume graph**
+* Invoice is finalized without reprocessing earlier steps
 
 ---
 
-## 7. Bigtool Selection Strategy
+## ▶️ How to Run
 
-Bigtool is used whenever a tool must be selected dynamically from a pool.
+From the project root:
 
-Example capabilities:
-
-* OCR providers
-* ERP connectors
-* Vendor enrichment sources
-* Databases
-
-Implementation approach:
-
-* Deterministic selection for demo purposes
-* Every tool choice is logged
-
-Example log:
-
-> `Bigtool selected OCR provider: tesseract`
-
----
-
-## 8. MCP Server Abstraction
-
-Abilities are routed via logical MCP servers:
-
-* **COMMON Server**
-
-  * Parsing
-  * Normalization
-  * Matching
-  * Accounting logic
-
-* **ATLAS Server**
-
-  * ERP access
-  * Vendor enrichment
-  * Notifications
-
-In this demo, MCP calls are **mocked** to focus on orchestration logic.
-
----
-
-## 9. API Endpoints
-
-| Endpoint                 | Method | Description              |
-| ------------------------ | ------ | ------------------------ |
-| `/run-workflow`          | POST   | Start invoice processing |
-| `/human-review/pending`  | GET    | List paused invoices     |
-| `/human-review/decision` | POST   | Accept / Reject invoice  |
-
----
-
-## 10. Demo Instructions
-
-### Run Locally
-
-```bash
-pip install -r requirements.txt
-python app/main.py
+```powershell
+python -m app.graph
 ```
 
-### Demo Flow
+### Expected Output
 
-1. Submit a valid invoice → full auto-processing
-2. Submit mismatched invoice → HITL pause
-3. Call `/human-review/decision` with ACCEPT
-4. Observe workflow resume & complete
-
-Logs clearly show:
-
-* Stage execution order
-* Tool selection
-* Checkpoint creation
-* Resume event
+* **PAUSED STATE** → Workflow stopped for HITL
+* **RESUMED FINAL STATE** → Invoice approved
 
 ---
 
-## 11. Tradeoffs & Design Decisions
+## 💡 Why This Design
 
-* Real APIs replaced with mocks for reliability
-* SQLite chosen for simplicity and transparency
-* No frontend UI — API-driven demo
-* Focus on correctness over scale
-
----
-
-## 12. Future Improvements
-
-* Real ERP / OCR integrations
-* Async execution & retries
-* Frontend Human Review dashboard
-* Multi-invoice batch processing
-* Observability (metrics, tracing)
+* Avoids re-running expensive or unsafe steps
+* Ensures auditability of human decisions
+* Makes HITL asynchronous and scalable
+* Aligns with real production workflow engines
 
 ---
 
-## 13. Conclusion
+## 🚀 Future Extensions
 
-This project demonstrates how **LangGraph + HITL + Bigtool** can be combined to build **robust, auditable, enterprise-grade AI workflows** suitable for finance and operations-heavy domains.
+* Replace mocks with OCR / LLM parsing
+* Add FastAPI for human approval UI
+* Support rejection & rework paths
+* Cloud DB or object storage for checkpoints
 
-The emphasis is on **statefulness, control, and human oversight** — not just automation.
+---
+
+## 🏁 Summary
+
+This project demonstrates a **correct, production-aligned Human-in-the-Loop workflow** using LangGraph with durable state persistence and deterministic resume semantics.
+
+It focuses on **architecture, correctness, and explainability**, which are critical for real-world AI systems involving human review.
+
+---
+
+**Author:** Commander
